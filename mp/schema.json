@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Service chain spec",
+  "description": "Management-plane spec: chain of network function nodes. Validated by the orchestrator before Click config generation. The chain is ordered: node i forwards to node i+1, the last node forwards to the internet. Cross-node rule (entrypoint == chain[0].ip) is checked in code, not here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["entrypoint", "chain"],
+  "properties": {
+    "entrypoint": {
+      "type": "string",
+      "description": "IP of the first node in the chain"
+    },
+    "chain": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "function", "ip"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Unique node name"
+          },
+          "function": {
+            "description": "Template from the function registry",
+            "enum": ["forwarder", "printer", "queue", "drop", "firewall"]
+          },
+          "ip": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Real cluster IP or k8s DNS name"
+          },
+          "setup": {
+            "type": "object",
+            "default": {},
+            "description": "Template-dependent params; see branches below"
+          }
+        },
+        "oneOf": [
+          {
+            "description": "forwarder: passthrough, no setup",
+            "properties": {
+              "function": { "const": "forwarder" },
+              "setup": {
+                "type": "object",
+                "maxProperties": 0
+              }
+            }
+          },
+          {
+            "description": "printer: print from->to at IP level; optional output target",
+            "properties": {
+              "function": { "const": "printer" },
+              "setup": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "to": { "enum": ["stdout", "file"] }
+                }
+              }
+            }
+          },
+          {
+            "description": "queue: rate, delay and/or queue-size shaping; at least one knob",
+            "properties": {
+              "function": { "const": "queue" },
+              "setup": {
+                "type": "object",
+                "additionalProperties": false,
+                "anyOf": [
+                  { "required": ["rate_mbps"] },
+                  { "required": ["delay_ms"] },
+                  { "required": ["size_pkts"] }
+                ],
+                "properties": {
+                  "rate_mbps": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Egress rate cap"
+                  },
+                  "delay_ms": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Per-packet added delay"
+                  },
+                  "size_pkts": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "description": "Max buffered packets; full queue drops new packets"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "description": "drop: fixed percent of traffic, set in setup",
+            "properties": {
+              "function": { "const": "drop" },
+              "setup": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "percent": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "default": 100,
+                    "description": "Fixed percent of packets to drop"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "description": "firewall: drop matched proto/port traffic",
+            "properties": {
+              "function": { "const": "firewall" },
+              "setup": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["proto"],
+                "properties": {
+                  "proto": {
+                    "enum": ["tcp", "udp", "icmp"]
+                  },
+                  "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

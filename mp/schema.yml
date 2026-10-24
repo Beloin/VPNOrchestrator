@@ -1,0 +1,52 @@
+# Example spec — an illustrative, fully-populated chain.
+# The chain is ordered: node i forwards to node i+1; the last node is the
+# egress and forwards to the internet. No "forward" fields in the schema.
+
+entrypoint: 10.0.0.1
+
+chain:
+  - name: prn
+    function: printer             # template from the registry (see below)
+    ip: 10.0.0.1
+    setup:
+      to: stdout
+
+  - name: limiter
+    function: queue
+    ip: 10.0.0.2
+    setup:
+      rate_mbps: 10               # optional
+      delay_ms: 5                 # optional
+      size_pkts: 100              # optional; full queue drops new packets
+
+  - name: fw
+    function: firewall
+    ip: 10.0.0.3
+    setup:
+      proto: tcp
+      port: 23
+
+  - name: sampler
+    function: drop
+    ip: 10.0.0.4
+    setup:
+      percent: 10                 # fixed percent, set in setup
+
+# Function template registry (pre-defined in the orchestrator, not here).
+#
+# function    | setup fields                        | click mapping (sketch)
+# ------------+-------------------------------------+--------------------------------
+# forwarder   | none                                | passthrough
+# printer     | optional: to: stdout|file           | print from->to at ip level
+# queue       | rate_mbps, delay_ms, size_pkts      | Queue / RatedSource
+# drop        | percent: 0-100 (default 100)        | RandomLoss(p) or Counter+Modulo
+#             |                                     | sampler; percent is fixed by setup
+# firewall    | proto: tcp|udp|icmp, port: int      | drop matched traffic (IPFilter)
+#
+# Validation:
+# - chain is non-empty
+# - chain[0].ip == entrypoint
+# - every ip unique, every name unique
+# - function is one of the registry templates
+# - setup fields match that template's allowed fields
+# - last node forwards to the internet (implicit: ordering)

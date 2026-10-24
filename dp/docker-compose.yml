@@ -1,0 +1,53 @@
+# Two-node Click chain + a pinger, on two L2 networks.
+#   net-a: pinger <-> click1 (eth0)
+#   net-b: click1 (eth1) <-> click2 (eth0)
+# Pinger's default route points at click1, so any ping is forced through the
+# chain; click1 IP-in-IP-forwards (IPEncap) to click2, which fakes the pong.
+
+services:
+  pinger:
+    build: .
+    entrypoint: []
+    # Route all traffic through click1, so ANY ping is forced into the chain.
+    command: ["sh", "-c", "ip route replace default via 10.10.0.11 && sleep infinity"]
+    cap_add: [NET_ADMIN]
+    networks:
+      net-a:
+        ipv4_address: 10.10.0.10
+        mac_address: "02:42:0a:0a:00:0a"
+
+  click1:
+    build: .
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.icmp_echo_ignore_all: "1"
+      net.ipv4.ip_forward: "0"
+    volumes:
+      - ./click1.click:/etc/click/router.click:ro
+    networks:
+      net-a:
+        ipv4_address: 10.10.0.11
+        mac_address: "02:42:0a:0a:00:0b"
+      net-b:
+        ipv4_address: 10.10.1.11
+        mac_address: "02:42:0a:0a:01:0b"
+
+  click2:
+    build: .
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.icmp_echo_ignore_all: "1"
+    volumes:
+      - ./click2.click:/etc/click/router.click:ro
+    networks:
+      net-b:
+        ipv4_address: 10.10.1.12
+        mac_address: "02:42:0a:0a:01:0c"
+
+networks:
+  net-a:
+    ipam:
+      config: [{ subnet: 10.10.0.0/24 }]
+  net-b:
+    ipam:
+      config: [{ subnet: 10.10.1.0/24 }]

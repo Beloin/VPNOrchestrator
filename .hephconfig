@@ -3,3 +3,4 @@ version: v1.0.0-alpha-build.435.2078+ga1ab80ec
 plugins:
   - builtin: buildfile
   - builtin: exec
+  - builtin: bash

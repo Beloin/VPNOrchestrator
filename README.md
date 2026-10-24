@@ -23,7 +23,8 @@ Concurrent workstreams. Each ships a small piece; integration checkpoints test t
 
 - [X] Pull/run Click in Docker; read `click --help` and the "Elements" wiki list inside a container.
 - [X] Hand-write one chain: `FromDevice -> Classifier -> ... -> ToDevice`.
-- [ ] Run it in one container, verify forwarding.
+- [X] Run it in one container, verify forwarding.
+  - Verified with a ping test, forwarding another docker on the same network to use a fixed IP, the ping is returned from the second click container
 
 ### Track B — Orchestrator (spec -> config)
 

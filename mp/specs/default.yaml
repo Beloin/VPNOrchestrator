@@ -1,0 +1,16 @@
+# Default spec — the baseline chain. current.yaml overrides it when valid.
+# Ordered chain: node i -> node i+1; last node is the egress (internet).
+entrypoint: 10.0.0.1
+
+chain:
+  - name: prn
+    function: printer
+    ip: 10.0.0.1
+    setup:
+      to: stdout
+
+  - name: limiter
+    function: queue
+    ip: 10.0.0.2
+    setup:
+      rate_mbps: 10
