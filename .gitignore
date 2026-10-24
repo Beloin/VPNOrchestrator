@@ -1,0 +1,23 @@
+# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
+# END heph-generated
+
+# heph workspace cache
+.heph/
+
+# Python (mp/ orchestrator)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
