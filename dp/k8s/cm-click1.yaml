@@ -1,0 +1,56 @@
+# click1's data-plane config — k8s-native. One pod interface (eth0), nothing
+# pinned. The pod's startup script fills __CLICK1_IP__/__CLICK1_MAC__/
+# __CLICK1_MACHEX__ from the Downward API + sysfs, and __CLICK2_IP__ from DNS
+# (headless Service click-2); ARPQuerier(IP, MAC) resolves neighbor MACs
+# dynamically. The leading destination-MAC classifier keeps promiscuous
+# FromDevice from re-processing the other pods' traffic on the shared pod L2
+# (that re-capture caused a re-encapsulation loop).
+#
+# Tunnel model: pinger's default route points at click1, so ANY destination is
+# tunneled. click1 receives the traffic on eth0, IP-in-IP encapsulates to click2,
+# and returns click2's reply to pinger. (A destination outside 10.244.0.0/16 gets
+# CNI-MASQUERADEd, so the reply goes to the gateway rather than pinger.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: click1-config
+  labels:
+    app: click-chain
+data:
+  router.click: |
+    // click1 — tunnel ingress. eth0 only; ARPQuerier does dynamic MAC lookup.
+
+    FromDevice(eth0)
+      -> mac :: Classifier(0/__CLICK1_MACHEX__, -);   // only frames addressed to me
+    mac[0]
+      -> c :: Classifier(12/0806 20/0001,   // ARP request
+                         12/0806 20/0002,   // ARP reply
+                         12/0800);          // IPv4
+    mac[1] -> Discard;                       // other pods' traffic on the L2
+
+    c[0] -> Discard;                         // kernel answers ARP for our IP
+    c[1] -> [1]arpq :: ARPQuerier(__CLICK1_IP__, __CLICK1_MAC__);
+    c[2] -> Strip(14)
+         -> CheckIPHeader
+         -> ic :: IPClassifier(ip proto 4, -);
+
+    // return: IP-in-IP from click2 -> strip outer -> ICMP reply to pinger
+    ic[0]
+      -> StripIPHeader
+      -> CheckIPHeader
+      -> Print('click1 out: reply to pinger')
+      -> arpq;
+
+    // forward: ICMP echo from pinger (dst 10.244.99.99) -> encapsulate to click2.
+    // Only echo requests: the pod kernel sends ICMP "protocol unreachable" for
+    // the IP-in-IP traffic, which must not be re-encapsulated (loop).
+    ic[1]
+      -> iec :: IPClassifier(icmp type echo, -);
+    iec[0]
+      -> Print('click1 in: echo from pinger')
+      -> IPEncap(4, __CLICK1_IP__, __CLICK2_IP__)
+      -> Print('click1 in: encapsulated to click2')
+      -> arpq;
+    iec[1] -> Discard;
+
+    arpq -> Queue -> ToDevice(eth0);

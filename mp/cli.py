@@ -5,7 +5,7 @@ Commands:
   use FILE    write FILE as current.yaml into the specs dir
   validate    validate the resolved spec (current.yaml, or default.yaml)
   show        print the resolved chain
-  run         generate click configs from the resolved spec (not implemented yet)
+  run         generate click configs + docker-compose from the resolved spec
 
 Spec lives in MP_SPEC_DIR (default ./specs, mount as a Docker volume).
 """
@@ -15,6 +15,7 @@ import shutil
 import sys
 from pathlib import Path
 
+import codegen
 import spec
 
 
@@ -56,9 +57,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    del args
-    _, source = _resolved()
-    print(f"# {source.value} -> click config (not implemented yet)", file=sys.stderr)
+    chain, source = _resolved()
+    out = Path(args.out)
+    files = codegen.gen_config(chain)
+    files = {f"{n}.click": c for n, c in files.items()} | {"docker-compose.yml": codegen.gen_compose(chain)}
+    out.mkdir(parents=True, exist_ok=True)
+    for name, text in files.items():
+        (out / name).write_text(text)
+    print(f"# {source.value} -> {out}/")
+    for name in files:
+        print(name)
     return 0
 
 
@@ -74,7 +82,8 @@ def main() -> int:
     s.set_defaults(fn=cmd_show)
     v = sub.add_parser("validate", help="validate the resolved spec")
     v.set_defaults(fn=cmd_validate)
-    r = sub.add_parser("run", help="generate click configs from the resolved spec")
+    r = sub.add_parser("run", help="generate click configs + compose from the resolved spec")
+    r.add_argument("--out", default="gen", help="generated files directory (default gen/)")
     r.set_defaults(fn=cmd_run)
     args = p.parse_args()
     return args.fn(args)

@@ -28,7 +28,7 @@ Concurrent workstreams. Each ships a small piece; integration checkpoints test t
 
 ### Track B — Orchestrator (spec -> config)
 
-- [ ] Define `spec.yaml` schema for one chain.
+- [X] Define `spec.yaml` schema for one chain.
 - [ ] `orchestrator.py` reads the spec, emits multiple Click configs (one per router) plus their K8s manifests.
 - [ ] Client node (TUN) manifest needs `privileged` (or `securityContext` `NET_ADMIN` + `/dev/net/tun`); other routers stay unprivileged.
 - [ ] Unit-test: generated config == hand-written config.
@@ -41,6 +41,9 @@ Concurrent workstreams. Each ships a small piece; integration checkpoints test t
 
 ### Track D — VPN tunnel
 
+- [ ] TODO: `dp/k8s/click-chain.yaml` is plain IP-in-IP (`IPEncap`/`IPDecap`) — a
+  tunnel, not yet a VPN. Add a crypto element (ESP/AH) between `IPDecap` and
+  emit so the payload is encrypted/authenticated, then key exchange (below).
 - [ ] GRE, no crypto: static tunnel, Click encapsulates.
 - [ ] IPSec: control plane exchanges keys, pushes to Click ESP elements.
 - [ ] Routes: "subnet X behind peer Y" (multi-site).

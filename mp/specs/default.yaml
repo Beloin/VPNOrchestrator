@@ -1,5 +1,8 @@
 # Default spec — the baseline chain. current.yaml overrides it when valid.
 # Ordered chain: node i -> node i+1; last node is the egress (internet).
+# Note docker topology constraint: each node's ip must sit in a distinct /24,
+# plus 10.254.254.0/24 is reserved (egress net), and hosts .250/.254 inside
+# every node subnet are synthesized (edge upstream / client).
 entrypoint: 10.0.0.1
 
 chain:
@@ -11,6 +14,6 @@ chain:
 
   - name: limiter
     function: queue
-    ip: 10.0.0.2
+    ip: 10.0.1.2
     setup:
       rate_mbps: 10

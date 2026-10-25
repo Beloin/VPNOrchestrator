@@ -1,0 +1,41 @@
+# Headless Services give each click instance a stable DNS name (click-1,
+# click-2) that resolves straight to the pod IP — the k8s-native stand-in for
+# the compose topology's hardcoded static IPs. `publishNotReadyAddresses` makes
+# the name resolvable the moment the pod is scheduled, so a pod can look up its
+# peer during startup (there is no readiness probe, so readiness would otherwise
+# lag the container entrypoint).
+apiVersion: v1
+kind: Service
+metadata:
+  name: click-1
+  labels:
+    app: click-chain
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: click1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: click-2
+  labels:
+    app: click-chain
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: click2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pinger
+  labels:
+    app: click-chain
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: pinger

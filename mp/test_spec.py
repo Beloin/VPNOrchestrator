@@ -16,6 +16,7 @@ from functions import (
     QueueSetup,
 )
 from spec import Node, Spec, SpecError, parse_spec_text
+import test_codegen as _cg
 
 # every function template in one valid chain; ordering implies the forwarding
 ALL_NODES_YAML = """
@@ -165,20 +166,23 @@ TESTS = [
     test_all_functions,
     test_two_functions,
     test_last_node_internet,
-]
+] + _cg.TESTS
 
 
 def main() -> int:
-    failed = 0
+    failures = []
     for t in TESTS:
         try:
             t()
             print(f"PASS {t.__name__}")
         except Exception as e:
-            failed += 1
-            print(f"FAIL {t.__name__}: {e}", file=sys.stderr)
-    print(f"{len(TESTS) - failed}/{len(TESTS)} passed")
-    return 1 if failed else 0
+            failures.append(f"FAIL {t.__name__}: {e}")
+    # print failures last on stdout: heph truncates the log tail, stderr-first
+    # output hides them
+    for f in failures:
+        print(f)
+    print(f"{len(TESTS) - len(failures)}/{len(TESTS)} passed")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -1,0 +1,139 @@
+# Three pods on the pod network (one interface each) + the startup wiring.
+# No netns, no init container, no MAC/IP pinning:
+#   - each pod resolves its peer's IP from DNS (headless Service click-1/click-2)
+#     and its own IP from the Downward API, then seds those into the click
+#     config template before launching click;
+#   - ARPQuerier resolves neighbor MACs dynamically, so no EtherEncap.
+#
+# Data path: pinger -> 10.99.99.99 (virtual inner address) -> click1 IP-in-IP
+# encaps -> click2 decaps + fake pong -> back.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: click1
+  labels:
+    app: click1
+spec:
+  containers:
+    - name: click1
+      image: click
+      imagePullPolicy: IfNotPresent
+      # privileged: userlevel click owns eth0 via pcap; privileged lets the pod
+      # write /proc/sys to silence its own kernel (ICMP redirects) so the
+      # kernel stays out of the data path.
+      securityContext:
+        privileged: true
+      env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      volumeMounts:
+        - name: click1-cfg
+          mountPath: /etc/click
+          readOnly: true
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          for i in $(seq 1 60); do
+            CLICK2_IP=$(getent hosts click-2 | awk 'NR==1 {print $1}')
+            [ -n "$CLICK2_IP" ] && break
+            sleep 1
+          done
+          [ -n "$CLICK2_IP" ] || { echo "click-2 not resolvable" >&2; exit 1; }
+          # keep the pod kernel out of the data path: no ICMP redirects to pinger
+          echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects 2>/dev/null || true
+          echo 0 > /proc/sys/net/ipv4/conf/eth0/send_redirects 2>/dev/null || true
+          MAC=$(cat /sys/class/net/eth0/address)
+          MACHEX=$(tr -d ':' < /sys/class/net/eth0/address)
+          sed -e "s/__CLICK1_IP__/${POD_IP}/g" \
+              -e "s/__CLICK2_IP__/${CLICK2_IP}/g" \
+              -e "s/__CLICK1_MAC__/${MAC}/g" \
+              -e "s/__CLICK1_MACHEX__/${MACHEX}/g" \
+              /etc/click/router.click > /tmp/router.click
+          exec click /tmp/router.click
+  volumes:
+    - name: click1-cfg
+      configMap:
+        name: click1-config
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: click2
+  labels:
+    app: click2
+spec:
+  containers:
+    - name: click2
+      image: click
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true
+      env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      volumeMounts:
+        - name: click2-cfg
+          mountPath: /etc/click
+          readOnly: true
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          for i in $(seq 1 60); do
+            CLICK1_IP=$(getent hosts click-1 | awk 'NR==1 {print $1}')
+            [ -n "$CLICK1_IP" ] && break
+            sleep 1
+          done
+          [ -n "$CLICK1_IP" ] || { echo "click-1 not resolvable" >&2; exit 1; }
+          echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects 2>/dev/null || true
+          echo 0 > /proc/sys/net/ipv4/conf/eth0/send_redirects 2>/dev/null || true
+          MAC=$(cat /sys/class/net/eth0/address)
+          MACHEX=$(tr -d ':' < /sys/class/net/eth0/address)
+          sed -e "s/__CLICK2_IP__/${POD_IP}/g" \
+              -e "s/__CLICK1_IP__/${CLICK1_IP}/g" \
+              -e "s/__CLICK2_MAC__/${MAC}/g" \
+              -e "s/__CLICK2_MACHEX__/${MACHEX}/g" \
+              /etc/click/router.click > /tmp/router.click
+          exec click /tmp/router.click
+  volumes:
+    - name: click2-cfg
+      configMap:
+        name: click2-config
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pinger
+  labels:
+    app: pinger
+spec:
+  containers:
+    - name: pinger
+      image: click
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        capabilities:
+          add: [NET_ADMIN]
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          for i in $(seq 1 60); do
+            CLICK1_IP=$(getent hosts click-1 | awk 'NR==1 {print $1}')
+            [ -n "$CLICK1_IP" ] && break
+            sleep 1
+          done
+          [ -n "$CLICK1_IP" ] || { echo "click-1 not resolvable" >&2; exit 1; }
+          # override the default route: ANY destination (e.g. 8.8.8.8) now goes
+          # to click1 and is tunneled, instead of the pod's normal egress. The
+          # connected pod-CIDR route is left intact so DNS/ARP still work.
+          ip route replace default via "$CLICK1_IP"
+          exec sleep infinity

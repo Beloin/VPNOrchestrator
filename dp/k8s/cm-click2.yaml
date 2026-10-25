@@ -1,0 +1,44 @@
+# click2's data-plane config — k8s-native. One pod interface (eth0). Decaps
+# IP-in-IP from click1, fabricates the ICMP echo reply (ICMPPingResponder),
+# tunnels it back. Placeholders filled by the pod's startup script from DNS +
+# sysfs. ARPQuerier(IP, MAC) does dynamic neighbor MAC resolution; the
+# destination-MAC classifier keeps promiscuous capture from re-processing other
+# pods' traffic.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: click2-config
+  labels:
+    app: click-chain
+data:
+  router.click: |
+    // click2 — tunnel egress / responder. eth0 only; ARPQuerier does dynamic MAC.
+
+    FromDevice(eth0)
+      -> mac :: Classifier(0/__CLICK2_MACHEX__, -);
+    mac[0]
+      -> c :: Classifier(12/0806 20/0001,
+                         12/0806 20/0002,
+                         12/0800);
+    mac[1] -> Discard;
+
+    c[0] -> Discard;
+    c[1] -> [1]arpq :: ARPQuerier(__CLICK2_IP__, __CLICK2_MAC__);
+    c[2] -> Strip(14)
+         -> CheckIPHeader
+         -> ic :: IPClassifier(ip proto 4, -);
+
+    // IP-in-IP from click1 -> strip outer -> ICMP echo -> fake pong -> back
+    ic[0]
+      -> Print('click2 in: ipip from click1')
+      -> StripIPHeader
+      -> CheckIPHeader
+      -> ICMPPingResponder()
+      -> Print('click2 out: fake pong')
+      -> IPEncap(4, __CLICK2_IP__, __CLICK1_IP__)
+      -> arpq;
+
+    // any other IPv4 on the pod network: ignore
+    ic[1] -> Discard;
+
+    arpq -> Queue -> ToDevice(eth0);
