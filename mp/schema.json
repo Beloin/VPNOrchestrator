@@ -1,36 +1,27 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Service chain spec",
-  "description": "Management-plane spec: chain of network function nodes. Validated by the orchestrator before Click config generation. The chain is ordered: node i forwards to node i+1, the last node forwards to the internet. Cross-node rule (entrypoint == chain[0].ip) is checked in code, not here.",
+  "description": "Management-plane spec: chain of network function nodes. Validated by the orchestrator before Click config generation. The chain is ordered: node i forwards to node i+1, the last node forwards to the internet. Addressing is handled by k8s (headless Service per node name), so nodes carry no IP.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["entrypoint", "chain"],
+  "required": ["chain"],
   "properties": {
-    "entrypoint": {
-      "type": "string",
-      "description": "IP of the first node in the chain"
-    },
     "chain": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "function", "ip"],
+        "required": ["name", "function"],
         "properties": {
           "name": {
             "type": "string",
             "minLength": 1,
-            "description": "Unique node name"
+            "description": "Unique node name; also its k8s headless Service DNS name"
           },
           "function": {
             "description": "Template from the function registry",
             "enum": ["forwarder", "printer", "queue", "drop", "firewall"]
-          },
-          "ip": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Real cluster IP or k8s DNS name"
           },
           "setup": {
             "type": "object",

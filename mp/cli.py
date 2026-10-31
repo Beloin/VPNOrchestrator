@@ -59,8 +59,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     chain, source = _resolved()
     out = Path(args.out)
-    files = codegen.gen_config(chain)
-    files = {f"{n}.click": c for n, c in files.items()} | {"docker-compose.yml": codegen.gen_compose(chain)}
+    files = codegen.gen_k8s(chain)
     out.mkdir(parents=True, exist_ok=True)
     for name, text in files.items():
         (out / name).write_text(text)

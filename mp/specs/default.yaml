@@ -1,19 +1,14 @@
 # Default spec — the baseline chain. current.yaml overrides it when valid.
 # Ordered chain: node i -> node i+1; last node is the egress (internet).
-# Note docker topology constraint: each node's ip must sit in a distinct /24,
-# plus 10.254.254.0/24 is reserved (egress net), and hosts .250/.254 inside
-# every node subnet are synthesized (edge upstream / client).
-entrypoint: 10.0.0.1
-
+# No IPs: k8s assigns addresses and each node is found by DNS (a headless
+# Service named after the node).
 chain:
   - name: prn
     function: printer
-    ip: 10.0.0.1
     setup:
       to: stdout
 
   - name: limiter
     function: queue
-    ip: 10.0.1.2
     setup:
       rate_mbps: 10

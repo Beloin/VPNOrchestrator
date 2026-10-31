@@ -1,121 +1,51 @@
-"""Generate Click configs + a docker-compose topology from a resolved Spec.
+"""Generate Click configs + k8s manifests from a resolved Spec.
 
-Topology: for an n-node chain (n >= 2), containers are wired on networks:
-    net-in   : pinger (client)      <-> node0 eth0
-    edge_i   : node_i eth1          <-> node_{i+1} eth0   (i = 0..n-2)
-    net-out  : node_{n-1} eth1      <-> sink (client)
+Topology: an ordered chain of n >= 2 nodes on the pod network. Each node is one
+pod with a single `eth0`; peers are found by DNS (a headless Service per node
+name) and neighbor MACs by ARP, so nothing is pinned. pinger sits in front of
+node0; the last node is the egress and NATs to the real internet.
 
-Addressing:
-- every node eth0 carries the node's spec IP — the spec's `ip` is the node's
-  ingress address, and its /24 defines the network it sits on:
-  net-in = node0's /24, edge_i = node_{i+1}'s /24.
-- eth1 addresses are synthesized: edge_i assigns .250 to the upstream host
-  (node_i's eth1). net-out is a fixed reserved subnet (EGRESS_NET/24): the
-  last node's eth1 = .250, the sink = .254 — so it never overlaps the chain's
-  /24s.
-- clients: pinger = net-in .254; its default gw = node0's spec IP.
-- all MACs derive from the IP (02:00:xx:xx:xx:xx), so Click configs and the
-  compose file agree with no registry. Requires spec IPs in distinct /24s
-  (synthesized .250 would collide otherwise); chain must fit one octet.
+Data plane: node i forwards to node i+1 by IP-in-IP encapsulation. Each node
+decapsulates, applies its function, and re-encapsulates (the egress instead
+NATs to the internet). Traffic is generic IPv4 and flows both ways; the
+function applies in both directions. The egress NAT is protocol-generic:
+TCP/UDP via IPRewriter, ICMP echo via ICMPPingRewriter.
 
-Click config per node is symmetric (one chain per direction), classified at
-the ether level, IP header checked, function elements applied on the push
-path, a Queue bridging push->pull (shaper elements are pull-side), and
-EtherEncap rewrites MACs toward the next hop: the upstream frame arrives with
-the upstream host's stale destination MAC, and real stacks (the sink) drop
-frames not addressed to them.
+Addressing: every config carries placeholders (`__MY_IP__`, `__MY_MAC__`,
+`__PREV_IP__`, `__NEXT_IP__`, ...) that the pod's startup script fills from the
+Downward API + sysfs + DNS + `ip route` before running click.
 """
 
-# TODO: bsena; Change codegen to use k8s instead of raw docker compose
-# also split k8s creation from click creation
-
-import yaml
-
-from dataclasses import dataclass
-
-from functions import FunctionName
+from functions import DropSetup, FirewallSetup, FunctionName
 from spec import Node, Spec
-
-SYNTH_HOST = "250"   # upstream host of an edge (previous node's eth1)
-CLIENT_HOST = "254"  # pinger on net-in, sink on net-out
-GATEWAY_HOST = "253" # docker bridge gateway on every generated network
-EGRESS_NET = "10.254.254"  # fixed net-out /24 base
-RESERVED_HOSTS = {SYNTH_HOST, CLIENT_HOST, GATEWAY_HOST}
-
-
-def _mac(ip: str) -> str:
-    return "02:00:" + ":".join(f"{int(b):02x}" for b in ip.split("."))
 
 
 class CodegenError(ValueError):
     pass
 
 
-@dataclass(frozen=True)
-class Iface:
-    net: str
-    ip: str
-    mac: str
+# TODO: bsena; Undestand this codegen so you dont be a dumb piece of shit
+
+# ---- function + shaping elements (shared with the old compose codegen) ----
 
 
-@dataclass(frozen=True)
-class NodePlan:
-    node: Node
-    eth0: Iface
-    eth1: Iface
-
-
-@dataclass(frozen=True)
-class Plan:
-    nodes: list[NodePlan]
-    nets: dict[str, str]  # network name -> "x.x.x.0/24"
-    pinger: Iface
-    sink: Iface
-
-
-def _subnet(ip: str) -> str:
-    return ip.rsplit(".", 1)[0] + ".0/24"
-
-
-def plan_topology(spec: Spec) -> Plan:
-    n = len(spec.nodes)
-    if n > 250:
-        raise CodegenError("chain too long: synthesized octets need n < 250")
-    if len({_subnet(node.ip) for node in spec.nodes}) != n:
-        raise CodegenError("every node spec IP must sit in a distinct /24")
-    if any(node.ip.startswith(EGRESS_NET + ".") for node in spec.nodes):
-        raise CodegenError(f"spec IPs must not overlap the reserved {EGRESS_NET}.0/24")
-    for node in spec.nodes:
-        host = node.ip.rsplit(".", 1)[1]
-        if host in RESERVED_HOSTS:
-            raise CodegenError(f"spec ip {node.ip}: host octet .{host} is reserved")
-
-    nets = {"net-in": _subnet(spec.nodes[0].ip), "net-out": f"{EGRESS_NET}.0/24"}
-    nodes_plan: list[NodePlan] = []
-
-    for i, node in enumerate(spec.nodes):
-        in_net = "net-in" if i == 0 else f"edge{i-1}"
-        out_net = f"edge{i}" if i < n - 1 else "net-out"
-        # edge_i's subnet = the downstream node's /24; its .250 is this node's eth1.
-        eth0_ip = node.ip
-        out_base = spec.nodes[i + 1].ip.rsplit(".", 1)[0] if i < n - 1 else EGRESS_NET
-        eth1_ip = f"{out_base}.{SYNTH_HOST}"
-        if i < n - 1:
-            nets[f"edge{i}"] = _subnet(spec.nodes[i + 1].ip)
-        nodes_plan.append(
-            NodePlan(
-                node=node,
-                eth0=Iface(in_net, eth0_ip, _mac(eth0_ip)),
-                eth1=Iface(out_net, eth1_ip, _mac(eth1_ip)),
-            )
-        )
-
-    p_base = spec.nodes[0].ip.rsplit(".", 1)[0]
-    pinger = Iface("net-in", f"{p_base}.{CLIENT_HOST}", _mac(f"{p_base}.{CLIENT_HOST}"))
-    sink = Iface("net-out", f"{EGRESS_NET}.{CLIENT_HOST}", _mac(f"{EGRESS_NET}.{CLIENT_HOST}"))
-
-    # sanity: an edge's subnet must not be its own client's subnet host
-    return Plan(nodes=nodes_plan, nets=nets, pinger=pinger, sink=sink)
+def _function_line(node: Node) -> str | None:
+    """Function element applied to the (inner) packet, or None for a forwarder."""
+    setup = node.setup
+    match node.function:
+        case FunctionName.PRINTER:
+            return f"Print('{node.name}: packet seen')"
+        case FunctionName.DROP:
+            assert isinstance(setup, DropSetup), "drop node needs DropSetup"
+            return f"RandomSample(DROP {setup.percent / 100:g})"
+        case FunctionName.FIREWALL:
+            assert isinstance(setup, FirewallSetup), "firewall node needs FirewallSetup"
+            rule = setup.proto.value
+            if setup.port is not None:
+                rule += f" dst port {setup.port}"
+            return f"IPFilter(drop {rule}, allow)"
+        case _:
+            return None  # forwarder / queue: shaping lives on the pull side
 
 
 def _pull_chain(node: Node) -> list[str]:
@@ -124,144 +54,358 @@ def _pull_chain(node: Node) -> list[str]:
     delay = getattr(node.setup, "delay_ms", None)
     rate = getattr(node.setup, "rate_mbps", None)
     if delay is not None:
-        # DelayUnqueue pulls from the Queue, delays, then pushes out; a second
-        # (unbounded) Queue bridges its push output back to the pull side.
+        # DelayUnqueue pulls, delays, then pushes; a second Queue bridges back.
         parts += [f"DelayUnqueue({delay:g}ms)", "Queue"]
     if rate is not None:
         parts.append(f"BandwidthShaper({rate:g}Mbps)")
     return parts
 
 
-def _function_line(node: Node) -> str | None:
-    """Function element applied on the push path, after CheckIPHeader."""
-    setup = node.setup
-    match node.function:
-        case FunctionName.PRINTER:
-            return f"Print('{node.name}: packet seen')"
-        case FunctionName.DROP:
-            if node.setup.percent is not None:
-                return f"RandomSample(DROP {setup.percent / 100:g})"
-            return "Discard()"
-        case FunctionName.FIREWALL:
-            rule = setup.proto.value
-            if setup.port is not None:
-                rule += f" dst port {setup.port}"
-            return f"IPFilter(drop {rule}, allow)"
-        case _:
-            return None  # forwarder; queue: shaping lives on the pull side
+def _pull(node: Node) -> list[str]:
+    size = getattr(node.setup, "size_pkts", None)
+    return [f"Queue({size})" if size is not None else "Queue"] + _pull_chain(node)
 
 
-def gen_node_config(plan: Plan, i: int) -> str:
-    """Full click config text for plan.nodes[i]."""
-    np = plan.nodes[i]
-    prv = plan.nodes[i - 1] if i > 0 else None
-    nxt = plan.nodes[i + 1] if i + 1 < len(plan.nodes) else None
-    node = np.node
+# ---- click config generation ----
+
+
+def gen_node_config(spec: Spec, i: int) -> str:
+    """Full click config text for spec.nodes[i]."""
+    node = spec.nodes[i]
+    n = len(spec.nodes)
     fn = _function_line(node)
+    fn_lines = [fn] if fn else []
 
-    pull = [f"Queue({s})" if (s := getattr(node.setup, "size_pkts", None)) is not None else "Queue"]
-    pull += _pull_chain(node)
+    is_ingress = i == 0
+    is_egress = i == n - 1
 
-    lines = [
-        f"// {np.node.name} — auto-generated. function: {node.function.value}.",
-        f"// {np.eth0.net} ({np.eth0.ip} = spec ip) -> {np.eth1.net} ({np.eth1.ip}, synthesized).",
-        "",
-    ]
-    for dir_label, in_dev, out_dev, src_if, dst_mac in (
-        ("out (toward internet)", "eth0", "eth1", np.eth1, nxt.eth0.mac if nxt else plan.sink.mac),
-        ("in (toward ingress)", "eth1", "eth0", np.eth0, prv.eth1.mac if prv else plan.pinger.mac),
-    ):
-        chain = [
-            f"FromDevice({in_dev})",
-            "Classifier(12/0800)",
-            "Strip(14)",
-            "CheckIPHeader()",
-        ]
-        if fn:
-            chain.append(fn)
-        chain.append(f"EtherEncap(0x0800, {src_if.mac}, {dst_mac})")
-        chain += pull
-        chain.append(f"ToDevice({out_dev})")
-        lines.append(f"// {dir_label}")
-        lines.append("\n  -> ".join(chain) + ";")
-        lines.append("")
-    return "\n".join(lines)
+    L: list[str] = []
+    role = "ingress" if is_ingress else ("egress" if is_egress else "relay")
+    L.append(f"// {node.name} — {role}. One pod interface (eth0). function: {node.function.value}.")
+    L.append("")
+    L.append("FromDevice(eth0)")
+    L.append("  -> mac :: Classifier(0/__MY_MACHEX__, -);")
+    L.append("mac[0]")
+    L.append("  -> c :: Classifier(12/0806 20/0001,   // ARP request")
+    L.append("                     12/0806 20/0002,   // ARP reply")
+    L.append("                     12/0800);          // IPv4")
+    L.append("mac[1] -> Discard;")
+    L.append("")
+    L.append("c[0] -> Discard;                         // kernel answers ARP")
+    L.append("c[1] -> [1]arpq :: ARPQuerier(__MY_IP__, __MY_MAC__);")
+
+    if is_ingress:
+        L.append("c[2] -> Strip(14)")
+        L.append("     -> CheckIPHeader")
+        L.append("     -> ic :: IPClassifier(ip proto 4, -);")
+        L.append("")
+        L.append("// return: IP-in-IP from next -> strip outer -> inner reply to pinger")
+        L.append("ic[0]")
+        L.append("  -> StripIPHeader")
+        L.append("  -> CheckIPHeader")
+        L += [f"  -> {x}" for x in fn_lines]
+        L.append("  -> arpq;")
+        L.append("")
+        L.append("// forward: any IPv4 from pinger -> function -> encapsulate to next")
+        L.append("ic[1]")
+        L += [f"  -> {x}" for x in fn_lines]
+        L.append("  -> IPEncap(4, __MY_IP__, __NEXT_IP__)")
+        L.append("  -> arpq;")
+
+    elif is_egress:
+        L.append("c[2] -> Strip(14)")
+        L.append("     -> CheckIPHeader")
+        L.append("     -> ic :: IPClassifier(ip proto 4, -);")
+        L.append("")
+        L.append("// stateful NAT: rewrite src -> __MY_IP__. TCP/UDP via IPRewriter, ICMP")
+        L.append("// echo via ICMPPingRewriter.")
+        L.append("iprw :: IPRewriter(pattern __MY_IP__ 50000-65535 - - 0 1);")
+        L.append("icmprw :: ICMPPingRewriter(pattern __MY_IP__ 50000-65535 - - 0 1);")
+        L.append("np :: IPClassifier(tcp or udp, icmp, -);")
+        L.append("ck :: IPClassifier(tcp, udp, -);")
+        L.append("")
+        L.append("// route lookup: local pod subnet -> direct, everything else -> gateway.")
+        L.append("rt :: RadixIPLookup(__MY_SUBNET__ 0, 0.0.0.0/0 __MY_GW__ 0);")
+        L.append("")
+        L.append("// forward: IP-in-IP from prev -> strip outer -> function -> NAT -> internet")
+        L.append("ic[0]")
+        L.append("  -> StripIPHeader")
+        L.append("  -> CheckIPHeader")
+        L += [f"  -> {x}" for x in fn_lines]
+        L.append("  -> np;")
+        L.append("")
+        L.append("// return: reply from internet -> reverse-NAT -> function -> encap -> prev")
+        L.append("ic[1]")
+        L.append("  -> np;")
+        L.append("")
+        L.append("np[0] -> [0]iprw;")
+        L.append("np[1] -> [0]icmprw;")
+        L.append("np[2] -> Discard;")
+        L.append("")
+        L.append("// recompute the L4 checksum after NAT: the pod's TX checksum offload")
+        L.append("// leaves a placeholder the veth never fills, so conntrack would drop it.")
+        L.append("iprw[0] -> ck;")
+        L.append("ck[0] -> SetTCPChecksum -> rt;")
+        L.append("ck[1] -> SetUDPChecksum -> rt;")
+        L.append("ck[2] -> rt;")
+        L.append("iprw[1]")
+        L += [f"  -> {x}" for x in fn_lines]
+        L.append("  -> IPEncap(4, __MY_IP__, __PREV_IP__)")
+        L.append("  -> rt;")
+        L.append("icmprw[0] -> rt;")
+        L.append("icmprw[1]")
+        L += [f"  -> {x}" for x in fn_lines]
+        L.append("  -> IPEncap(4, __MY_IP__, __PREV_IP__)")
+        L.append("  -> rt;")
+        L.append("")
+        L.append("rt[0] -> arpq;")
+        L.append("rt[1] -> Discard;")
+
+    else:
+        # relay: distinguish the two IP-in-IP neighbors by their outer source IP
+        L.append("c[2] -> Strip(14)")
+        L.append("     -> CheckIPHeader")
+        L.append("     -> ic :: IPClassifier(ip proto 4 and src __PREV_IP__,")
+        L.append("                          ip proto 4 and src __NEXT_IP__,")
+        L.append("                          -);")
+        L.append("")
+        L.append("// forward: from prev -> strip outer -> function -> re-encap to next")
+        L.append("ic[0]")
+        L.append("  -> StripIPHeader")
+        L.append("  -> CheckIPHeader")
+        L += [f"  -> {x}" for x in fn_lines]
+        L.append("  -> IPEncap(4, __MY_IP__, __NEXT_IP__)")
+        L.append("  -> arpq;")
+        L.append("")
+        L.append("// return: from next -> strip outer -> function -> re-encap to prev")
+        L.append("ic[1]")
+        L.append("  -> StripIPHeader")
+        L.append("  -> CheckIPHeader")
+        L += [f"  -> {x}" for x in fn_lines]
+        L.append("  -> IPEncap(4, __MY_IP__, __PREV_IP__)")
+        L.append("  -> arpq;")
+        L.append("ic[2] -> Discard;")
+
+    pull = _pull(node)
+    L.append("")
+    L.append(" -> ".join(["arpq"] + pull + ["ToDevice(eth0)"]) + ";")
+    return "\n".join(L)
 
 
 def gen_config(spec: Spec) -> dict[str, str]:
     """node name -> full click config text."""
-    plan = plan_topology(spec)
-    return {np.node.name: gen_node_config(plan, i) for i, np in enumerate(plan.nodes)}
+    return {node.name: gen_node_config(spec, i) for i, node in enumerate(spec.nodes)}
 
 
-def gen_compose(spec: Spec, image: str = "click") -> str:
-    """docker-compose.yml text wiring the chain for real-instance validation."""
-    plan = plan_topology(spec)
-    if len(plan.nodes) < 2:
-        raise CodegenError("compose topology needs >= 2 nodes (net-in and net-out must differ)")
+# ---- k8s manifest generation ----
 
-    def node_service(np: NodePlan) -> dict:
-        # Docker numbers container interfaces by alphabetical network name, not
-        # by this spec's order — so the click config's eth0/eth1 are pinned per
-        # run: rename both interfaces to their final names by their
-        # deterministic MAC before starting click.
-        rename = (
-            "a() { for i in /sys/class/net/*/address; do [ \"$(cat \"$i\")\" = \"$1\" ] && echo \"${i%/address}\" && break; done; }; "
-            "A=$(a \"$MP_IN_MAC\"); B=$(a \"$MP_OUT_MAC\"); A=${A##*/}; B=${B##*/}; "
-            "ip link set dev \"$A\" down; ip link set dev \"$A\" name tmpa; "
-            "ip link set dev \"$B\" down; ip link set dev \"$B\" name tmpb; "
-            "ip link set dev tmpa name eth0; ip link set dev tmpb name eth1; "
-            "ip link set dev eth0 up; ip link set dev eth1 up; "
-            "exec click /etc/click/router.click"
+
+def _startup(spec: Spec, i: int) -> str:
+    """Shell startup script for spec.nodes[i]: resolve peers, sed, run click."""
+    n = len(spec.nodes)
+    is_ingress = i == 0
+    is_egress = i == n - 1
+    needs_prev = not is_ingress
+    needs_next = not is_egress
+
+    lines = ["set -e"]
+    if needs_next:
+        nxt = spec.nodes[i + 1].name
+        lines += [
+            "for i in $(seq 1 60); do",
+            f"  NEXT_IP=$(getent hosts {nxt} | awk 'NR==1 {{print $1}}')",
+            "  [ -n \"$NEXT_IP\" ] && break",
+            "  sleep 1",
+            "done",
+            f"[ -n \"$NEXT_IP\" ] || {{ echo \"{nxt} not resolvable\" >&2; exit 1; }}",
+        ]
+    if needs_prev:
+        prv = spec.nodes[i - 1].name
+        lines += [
+            "for i in $(seq 1 60); do",
+            f"  PREV_IP=$(getent hosts {prv} | awk 'NR==1 {{print $1}}')",
+            "  [ -n \"$PREV_IP\" ] && break",
+            "  sleep 1",
+            "done",
+            f"[ -n \"$PREV_IP\" ] || {{ echo \"{prv} not resolvable\" >&2; exit 1; }}",
+        ]
+    lines += [
+        "echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects 2>/dev/null || true",
+        "echo 0 > /proc/sys/net/ipv4/conf/eth0/send_redirects 2>/dev/null || true",
+        "MAC=$(cat /sys/class/net/eth0/address)",
+        "MACHEX=$(tr -d ':' < /sys/class/net/eth0/address)",
+    ]
+    sed = ["sed"]
+    sed += ['-e "s/__MY_IP__/${POD_IP}/g"']
+    sed += ['-e "s/__MY_MAC__/${MAC}/g"']
+    sed += ['-e "s/__MY_MACHEX__/${MACHEX}/g"']
+    if needs_next:
+        sed += ['-e "s/__NEXT_IP__/${NEXT_IP}/g"']
+    if needs_prev:
+        sed += ['-e "s/__PREV_IP__/${PREV_IP}/g"']
+    if is_egress:
+        lines += [
+            "GW=$(ip route | awk '/default/ {print $3; exit}')",
+            "SUBNET=$(ip route | awk '/scope link/ {print $1; exit}')",
+        ]
+        sed += ['-e "s/__MY_GW__/${GW}/g"']
+        sed += ['-e "s|__MY_SUBNET__|${SUBNET}|g"']
+    sed += ["/etc/click/router.click > /tmp/router.click"]
+    lines.append(" \\\n    ".join(sed))
+    lines.append("exec click /tmp/router.click")
+    return "\n".join(lines)
+
+
+def gen_k8s(spec: Spec, image: str = "click") -> dict[str, str]:
+    """k8s manifests: services, per-node ConfigMaps, pods, deploy.sh."""
+    if len(spec.nodes) < 2:
+        raise CodegenError("k8s chain needs >= 2 nodes (ingress and egress must differ)")
+
+    files: dict[str, str] = {}
+    cfgs = gen_config(spec)
+
+    # headless Services (one per node + pinger), so names resolve to pod IPs
+    svcs = []
+    for node in spec.nodes:
+        svcs.append(
+            f"""apiVersion: v1
+kind: Service
+metadata:
+  name: {node.name}
+  labels:
+    app: {node.name}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: {node.name}"""
         )
-        # compose interpolates $ in strings; escape to pass them through
-        rename = rename.replace("$", "$$")
-        return {
-            "image": image,
-            "entrypoint": [],
-            "cap_add": ["NET_ADMIN", "NET_RAW"],
-            "sysctls": {"net.ipv4.ip_forward": "0"},
-            "volumes": [f"./{np.node.name}.click:/etc/click/router.click:ro"],
-            "environment": {"MP_IN_MAC": np.eth0.mac, "MP_OUT_MAC": np.eth1.mac},
-            "command": ["sh", "-c", rename],
-            "networks": {
-                np.eth0.net: {"ipv4_address": np.eth0.ip, "mac_address": np.eth0.mac},
-                np.eth1.net: {"ipv4_address": np.eth1.ip, "mac_address": np.eth1.mac},
-            },
-        }
+    svcs.append(
+        """apiVersion: v1
+kind: Service
+metadata:
+  name: pinger
+  labels:
+    app: pinger
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: pinger"""
+    )
+    files["services.yaml"] = "\n---\n".join(svcs) + "\n"
 
-    compose = {
-        "services": {
-            "pinger": {
-                "image": image,
-                "entrypoint": [],
-                "command": [
-                    "sh", "-c",
-                    f"ip route replace default via {plan.nodes[0].eth0.ip} && sleep infinity",
-                ],
-                "cap_add": ["NET_ADMIN"],
-                "networks": {
-                    plan.pinger.net: {"ipv4_address": plan.pinger.ip, "mac_address": plan.pinger.mac},
-                },
-            },
-            "sink": {
-                "image": image,
-                "entrypoint": [],
-                "command": [
-                    "sh", "-c",
-                    f"ip route replace default via {plan.nodes[-1].eth1.ip} && sleep infinity",
-                ],
-                "cap_add": ["NET_ADMIN"],
-                "networks": {
-                    plan.sink.net: {"ipv4_address": plan.sink.ip, "mac_address": plan.sink.mac},
-                },
-            },
-        },
-        "networks": {
-            net: {"ipam": {"config": [{"subnet": subnet, "gateway": f"{subnet.rsplit('.', 1)[0]}.{GATEWAY_HOST}"}]}}
-            for net, subnet in plan.nets.items()
-        },
-    }
-    for np in plan.nodes:
-        compose["services"][np.node.name] = node_service(np)
-    return yaml.safe_dump(compose, default_flow_style=False, sort_keys=False)
+    # ConfigMap per node
+    for node in spec.nodes:
+        body = chr(10).join("    " + ln if ln else "" for ln in cfgs[node.name].splitlines())
+        files[f"cm-{node.name}.yaml"] = f"""apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {node.name}-config
+  labels:
+    app: {node.name}
+data:
+  router.click: |
+{body}
+"""
+
+    # pods: pinger + one per node
+    pods = []
+
+    def pod(name: str, app: str, script: str, privileged: bool, needs_cfg: str | None) -> str:
+        sec = "        privileged: true\n" if privileged else (
+            "        capabilities:\n          add: [NET_ADMIN]\n"
+        )
+        env = ""
+        vols = ""
+        mounts = ""
+        if needs_cfg:
+            env = """      env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+"""
+            mounts = """      volumeMounts:
+        - name: cfg
+          mountPath: /etc/click
+          readOnly: true
+"""
+            vols = f"""  volumes:
+    - name: cfg
+      configMap:
+        name: {needs_cfg}
+"""
+        return f"""apiVersion: v1
+kind: Pod
+metadata:
+  name: {name}
+  labels:
+    app: {app}
+spec:
+  containers:
+    - name: {name}
+      image: {image}
+      imagePullPolicy: IfNotPresent
+      securityContext:
+{sec}{env}{mounts}      command:
+        - sh
+        - -c
+        - |
+{chr(10).join('          ' + ln for ln in script.splitlines())}
+{vols}"""
+
+    pods.append(
+        pod(
+            "pinger",
+            "pinger",
+            "\n".join(
+                [
+                    "set -e",
+                    "for i in $(seq 1 60); do",
+                    f"  NODE0_IP=$(getent hosts {spec.nodes[0].name} | awk 'NR==1 {{print $1}}')",
+                    "  [ -n \"$NODE0_IP\" ] && break",
+                    "  sleep 1",
+                    "done",
+                    f"[ -n \"$NODE0_IP\" ] || {{ echo \"{spec.nodes[0].name} not resolvable\" >&2; exit 1; }}",
+                    "ip route replace default via \"$NODE0_IP\"",
+                    "exec sleep infinity",
+                ]
+            ),
+            privileged=False,
+            needs_cfg=None,
+        )
+    )
+    for i, node in enumerate(spec.nodes):
+        pods.append(pod(node.name, node.name, _startup(spec, i), privileged=True, needs_cfg=f"{node.name}-config"))
+
+    files["pods.yaml"] = "\n---\n".join(pods) + "\n"
+
+    # deploy.sh: ordered apply + pinger MASQUERADE exemption (single NAT at egress)
+    files["deploy.sh"] = """#!/usr/bin/env bash
+# Deploy the generated chain: headless Services -> ConfigMaps -> pods, then
+# exempt the pinger from CNI MASQUERADE so its source IP survives to the egress
+# node (single NAT at the egress; a double NAT would send replies to the gateway).
+set -euo pipefail
+cd "$(dirname "$0")"
+
+kubectl apply -f services.yaml
+for f in cm-*.yaml; do kubectl apply -f "$f"; done
+kubectl apply -f pods.yaml
+
+for pod in %(podnames)s; do
+  kubectl wait --for=condition=Ready pod/$pod --timeout=120s
+done
+
+PINGER_IP=$(kubectl get pod pinger -o jsonpath='{.status.podIP}')
+minikube ssh -- "sudo iptables -t nat -I POSTROUTING 1 -s $PINGER_IP/32 -j ACCEPT"
+
+kubectl get pod -o wide
+echo
+echo "Test:  kubectl exec pinger -- ping -c 3 8.8.8.8"
+echo "Cleanup:"
+echo "  kubectl delete -f pods.yaml -f cm-*.yaml -f services.yaml"
+echo "  minikube ssh -- sudo iptables -t nat -D POSTROUTING -s $PINGER_IP/32 -j ACCEPT"
+""" % {"podnames": " ".join(node.name for node in spec.nodes)}
+
+    return files

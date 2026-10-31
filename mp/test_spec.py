@@ -20,44 +20,37 @@ import test_codegen as _cg
 
 # every function template in one valid chain; ordering implies the forwarding
 ALL_NODES_YAML = """
-entrypoint: 10.0.0.1
 chain:
   - name: prn
     function: printer
-    ip: 10.0.0.1
     setup:
       to: file
   - name: lim
     function: queue
-    ip: 10.0.0.2
     setup:
       rate_mbps: 5
       delay_ms: 2
       size_pkts: 64
   - name: fw
     function: firewall
-    ip: 10.0.0.3
     setup:
       proto: udp
       port: 53
   - name: rd
     function: drop
-    ip: 10.0.0.4
     setup:
       percent: 25
   - name: rel
     function: forwarder
-    ip: 10.0.0.5
 """
 
 ALL_NODES_SPEC = Spec(
-    entrypoint="10.0.0.1",
     nodes=[
-        Node("prn", FunctionName.PRINTER, "10.0.0.1", PrinterSetup(to="file")),
-        Node("lim", FunctionName.QUEUE, "10.0.0.2", QueueSetup(rate_mbps=5.0, delay_ms=2.0, size_pkts=64)),
-        Node("fw", FunctionName.FIREWALL, "10.0.0.3", FirewallSetup(proto=Proto.UDP, port=53)),
-        Node("rd", FunctionName.DROP, "10.0.0.4", DropSetup(percent=25.0)),
-        Node("rel", FunctionName.FORWARDER, "10.0.0.5", ForwarderSetup()),
+        Node("prn", FunctionName.PRINTER, PrinterSetup(to="file")),
+        Node("lim", FunctionName.QUEUE, QueueSetup(rate_mbps=5.0, delay_ms=2.0, size_pkts=64)),
+        Node("fw", FunctionName.FIREWALL, FirewallSetup(proto=Proto.UDP, port=53)),
+        Node("rd", FunctionName.DROP, DropSetup(percent=25.0)),
+        Node("rel", FunctionName.FORWARDER, ForwarderSetup()),
     ],
 )
 
@@ -69,8 +62,8 @@ def test_all_nodes_chain() -> None:
 
 def test_no_nodes() -> None:
     for name, text in [
-        ("empty chain", "entrypoint: 10.0.0.1\nchain: []\n"),
-        ("missing chain", "entrypoint: 10.0.0.1\n"),
+        ("empty chain", "chain: []\n"),
+        ("missing chain", "{}\n"),
     ]:
         try:
             parse_spec_text(text)
@@ -81,8 +74,7 @@ def test_no_nodes() -> None:
 
 def test_all_functions() -> None:
     """One single-node chain per function template, each against its setup class."""
-    entry = "entrypoint: 10.0.0.9\n"
-    node = "- name: a\n    function: {}\n    ip: 10.0.0.9\n"
+    node = "- name: a\n    function: {}\n"
     cases = [
         (node.format("forwarder"), ForwarderSetup()),
         (node.format("printer") + "    setup:\n      to: stdout\n", PrinterSetup(to="stdout")),
@@ -97,7 +89,7 @@ def test_all_functions() -> None:
         ),
     ]
     for yaml_body, setup in cases:
-        got = parse_spec_text(entry + "chain:\n  " + yaml_body)
+        got = parse_spec_text("chain:\n  " + yaml_body)
         assert got.nodes[0].name == "a" and got.next(got.nodes[0]) == "internet"
         assert got.nodes[0].setup == setup, f"{setup} != {got.nodes[0].setup}"
 
@@ -110,7 +102,7 @@ def test_all_functions() -> None:
     ]
     for raw, what in bad:
         try:
-            parse_spec_text(entry + "chain:\n  " + raw)
+            parse_spec_text("chain:\n  " + raw)
             raise AssertionError(f"bad {what} setup: expected SpecError")
         except SpecError:
             pass
@@ -119,19 +111,15 @@ def test_all_functions() -> None:
 def test_two_functions() -> None:
     got = parse_spec_text(
         """
-entrypoint: 10.0.0.1
 chain:
   - name: prn
     function: printer
-    ip: 10.0.0.1
   - name: lim
     function: queue
-    ip: 10.0.0.2
     setup:
       rate_mbps: 10
 """
     )
-    assert got.entrypoint == "10.0.0.1"
     assert [n.name for n in got.nodes] == ["prn", "lim"]
     assert got.nodes[0].setup == PrinterSetup(to="stdout")  # default setup
 
@@ -147,17 +135,25 @@ def test_last_node_internet() -> None:
     try:
         parse_spec_text(
             """
-entrypoint: 10.0.0.1
 chain:
   - name: prn
     function: printer
     forward: limiter
-    ip: 10.0.0.1
 """
         )
         raise AssertionError("explicit forward: expected SpecError")
     except SpecError:
         pass
+
+
+def test_dns_names() -> None:
+    """Node names become k8s Service/DNS names, so they must be RFC1123 labels."""
+    for name in ["Bad_Name", "UPPER", "has space", "under_score"]:
+        try:
+            parse_spec_text(f"chain:\n  - name: {name}\n    function: forwarder\n")
+            raise AssertionError(f"{name!r}: expected SpecError")
+        except SpecError as e:
+            assert "DNS label" in str(e), f"{name!r}: unexpected error: {e}"
 
 
 TESTS = [
@@ -166,6 +162,7 @@ TESTS = [
     test_all_functions,
     test_two_functions,
     test_last_node_internet,
+    test_dns_names,
 ] + _cg.TESTS
 
 

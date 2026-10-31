@@ -32,15 +32,14 @@ class SpecError(Exception):
 class Node:
     name: str
     function: FunctionName
-    ip: str  # real cluster ip or k8s dns name
     setup: Setup
 
 
 @dataclass(frozen=True)
 class Spec:
-    entrypoint: str
     # Ordered chain: nodes[i] forwards to nodes[i+1]; the egress node (last)
-    # forwards to the internet.
+    # forwards to the internet. No IPs here: k8s assigns addresses and each
+    # node is found by DNS (headless Service named after the node).
     nodes: list[Node]
 
     @property
@@ -54,12 +53,10 @@ class Spec:
         return self.nodes[i + 1].name if i < len(self.nodes) - 1 else "internet"
 
     def line(self, n: Node) -> str:
-        return f"{n.name}: {n.function.value} @ {n.ip} -> {self.next(n)} (setup: {n.setup.summary()})"
+        return f"{n.name}: {n.function.value} -> {self.next(n)} (setup: {n.setup.summary()})"
 
     def __str__(self) -> str:
-        lines = [f"entrypoint: {self.entrypoint}"]
-        lines += [self.line(n) for n in self.nodes]
-        return "\n".join(lines)
+        return "\n".join(self.line(n) for n in self.nodes)
 
 
 def validate(spec: dict) -> list[str]:
@@ -77,6 +74,8 @@ def validate(spec: dict) -> list[str]:
 
 def cross_validate(spec: dict) -> list[str]:
     """Cross-node rules JSON Schema cannot express."""
+    import re
+
     errs: list[str] = []
     chain = spec.get("chain", [])
     names = [n["name"] for n in chain]
@@ -84,14 +83,10 @@ def cross_validate(spec: dict) -> list[str]:
     if len(names) != len(set(names)):
         errs.append("chain: duplicate node names")
 
-    if len({n["ip"] for n in chain}) != len(chain):
-        errs.append("chain: duplicate node ips")
-
-    if chain:
-        if spec.get("entrypoint") != chain[0]["ip"]:
-            errs.append(
-                f"entrypoint: {spec.get('entrypoint')} != chain[0].ip {chain[0]['ip']}"
-            )
+    # node names become k8s Service/DNS names, so they must be RFC1123 DNS labels
+    for n in names:
+        if not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", n):
+            errs.append(f"chain: node name {n!r} is not a valid DNS label")
 
     return errs
 
@@ -122,14 +117,13 @@ def _to_spec(raw: dict) -> Spec:
                 Node(
                     name=n["name"],
                     function=function,
-                    ip=n["ip"],
                     setup=REGISTRY[function].parse(n.get("setup")),
                 )
             )
     except (SetupError, ValueError, KeyError) as e:
         raise SpecError(str(e)) from e
 
-    return Spec(entrypoint=raw["entrypoint"], nodes=nodes)
+    return Spec(nodes=nodes)
 
 
 def resolve() -> tuple[Spec, SpecSource]:

@@ -1,9 +1,9 @@
-# click2's data-plane config — k8s-native. One pod interface (eth0). Decaps
-# IP-in-IP from click1, fabricates the ICMP echo reply (ICMPPingResponder),
-# tunnels it back. Placeholders filled by the pod's startup script from DNS +
-# sysfs. ARPQuerier(IP, MAC) does dynamic neighbor MAC resolution; the
-# destination-MAC classifier keeps promiscuous capture from re-processing other
-# pods' traffic.
+# click2's data-plane config — k8s-native egress. One pod interface (eth0).
+# Decaps IP-in-IP from click1, NATs the inner ICMP echo (src -> click2, ICMP id
+# rewritten statefully), routes + forwards to the real internet, and
+# reverse-NATs the reply back through the tunnel. ARPQuerier(IP, MAC) does
+# dynamic neighbor MAC resolution; the destination-MAC classifier keeps
+# promiscuous capture from re-processing other pods' traffic.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,7 +12,7 @@ metadata:
     app: click-chain
 data:
   router.click: |
-    // click2 — tunnel egress / responder. eth0 only; ARPQuerier does dynamic MAC.
+    // click2 — tunnel egress. NATs inner ICMP echo to the real internet.
 
     FromDevice(eth0)
       -> mac :: Classifier(0/__CLICK2_MACHEX__, -);
@@ -28,17 +28,35 @@ data:
          -> CheckIPHeader
          -> ic :: IPClassifier(ip proto 4, -);
 
-    // IP-in-IP from click1 -> strip outer -> ICMP echo -> fake pong -> back
+    // stateful ICMP echo NAT: rewrite src -> __CLICK2_IP__, keep dst. Forward
+    // echo requests go to output 0, reverse-NAT'd replies to output 1.
+    ping_rw :: ICMPPingRewriter(pattern __CLICK2_IP__ 50000-65535 - - 0 1);
+
+    // route lookup: local pod subnet -> direct, everything else -> gateway.
+    rt :: RadixIPLookup(__CLICK2_SUBNET__ 0, 0.0.0.0/0 __CLICK2_GW__ 0);
+
+    // forward: IP-in-IP from click1 -> strip outer -> NAT -> route -> internet
     ic[0]
-      -> Print('click2 in: ipip from click1')
       -> StripIPHeader
       -> CheckIPHeader
-      -> ICMPPingResponder()
-      -> Print('click2 out: fake pong')
-      -> IPEncap(4, __CLICK2_IP__, __CLICK1_IP__)
-      -> arpq;
+      -> Print('click2 in: ipip from click1')
+      -> [0]ping_rw;
 
-    // any other IPv4 on the pod network: ignore
-    ic[1] -> Discard;
+    // reply: from internet (dst = click2) -> reverse-NAT -> re-encap -> click1
+    ic[1]
+      -> Print('click2 in: reply from internet')
+      -> [0]ping_rw;
+
+    ping_rw[0]
+      -> Print('click2 out: to internet')
+      -> rt;
+
+    ping_rw[1]
+      -> Print('click2 out: reply to tunnel')
+      -> IPEncap(4, __CLICK2_IP__, __CLICK1_IP__)
+      -> rt;
+
+    rt[0] -> arpq;
+    rt[1] -> Discard;
 
     arpq -> Queue -> ToDevice(eth0);

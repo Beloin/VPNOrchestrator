@@ -46,6 +46,69 @@ New findings (each cost deploy cycles):
     **read-only in a non-privileged container**, so click1/click2 run
     `privileged: true`.
 
+## Internet egress (real NAT) — validated
+
+click2 stops faking the pong and NATs inner traffic to the real internet:
+`ICMPPingRewriter` (stateful ICMP NAT) + `RadixIPLookup` (gateway routing) +
+`ARPQuerier`. **Working: `ping -c 3 8.8.8.8` → 3/3 real replies** (ttl 113,
+~64ms), pinger exempt from CNI MASQUERADE.
+
+17. **`IPRewriter` does not handle ICMP echo** — it silently drops the packet
+    (no output). Use `ICMPPingRewriter` for ICMP echo NAT.
+
+18. **Click 2.1 `ICMPPingRewriter` uses the Rewriter input-spec syntax, not
+    `(NEWSRC, NEWDST)`.** Correct form: `ICMPPingRewriter(pattern SADDR SPORT
+    DADDR DPORT FOUTPUT ROUTPUT)` with a *single* input — feed both forward
+    echo requests and replies to `[0]`, and split them by output (0 = forward,
+    1 = reply). `(IP, -)` parsed clean standalone but failed once wired
+    (`input spec 0: unknown specification`).
+
+19. **`ARPQuerier` ARPs the destination IP directly — it does not route via the
+    gateway.** For internet egress, insert `RadixIPLookup` before it so
+    non-local destinations get the gateway as the ARP target. Syntax is
+    `RadixIPLookup(PREFIX [GATEWAY] OUTPUT, ...)` — each entry needs a trailing
+    output port (e.g. `10.244.0.0/16 0, 0.0.0.0/0 10.244.0.1 0`). Subnet +
+    gateway are read from `ip route` at pod start (placeholders `__CLICK2_GW__`,
+    `__CLICK2_SUBNET__`). `LookupIPRoute` (kernel route table) is NOT in this
+    build.
+
+20. **Internet egress needs the pinger exempt from CNI MASQUERADE.** Otherwise
+    the echo's source is SNAT'd to `10.244.0.1`, click2 reverse-NATs the reply
+    to the gateway (double NAT), and pinger sees nothing. The node needs one
+    rule: `iptables -t nat -I POSTROUTING -s <pinger-ip>/32 -j ACCEPT`
+    (`deploy.sh` adds it). This is a node firewall change — required for a clean
+    single NAT at click2.
+
+## Generic traffic (TCP/UDP + ICMP) — validated
+
+The codegen egress NAT was made protocol-generic: `IPRewriter` for TCP/UDP +
+`ICMPPingRewriter` for ICMP echo, split by `IPClassifier(tcp or udp, icmp, -)`.
+**Working end-to-end on k8s: ping 2/2, `bash /dev/tcp/8.8.8.8/53` connects,
+and a raw DNS query to 8.8.8.8 returns google.com's A record.** (Verified
+with `ip_forward=0` so click is the only path — see 23.)
+
+21. **`IPRewriter` pattern syntax is the same 6-field Rewriter form as
+    `ICMPPingRewriter`:** `IPRewriter(pattern SADDR SPORT DADDR DPORT FOUTPUT
+    ROUTPUT)`. One element handles both TCP and UDP (the flow ID carries the
+    protocol). `IPClassifier(tcp or udp, icmp, -)` is valid and routes by
+    protocol.
+
+22. **The pod's TX checksum offload breaks click-NAT'd TCP/UDP.** The pod
+    kernel leaves a placeholder L4 checksum (veth never fills it), click's
+    `IPRewriter` only *increments* it, so the NAT'd packet carries a wrong
+    checksum and the host conntrack silently drops it (no conntrack entry, no
+    MASQUERADE, no reply) — ICMP is unaffected because its checksum isn't
+    offloaded. Fix: `SetTCPChecksum`/`SetUDPChecksum` on the IPRewriter forward
+    output, split by a `IPClassifier(tcp, udp, -)`. Diagnosed by conntrack
+    showing the NAT'd ICMP echo MASQUERADEd but no NAT'd TCP SYN entry, and a
+    hand-verified checksum mismatch.
+
+23. **Pods default to `ip_forward=1`**, so the kernel *also* forwards the
+    pinger's traffic (a second, MASQUERADEd path) alongside click. This masked
+    the broken click NAT during ICMP testing — ping "worked" via the kernel
+    path even though click's NAT was failing. Set `ip_forward=0` to make click
+    the only forwarder before asserting on the click path.
+
 ## Status: data path validated on k8s (netns approach, superseded)
 
 - The pod topology was replicated end-to-end inside a privileged docker
